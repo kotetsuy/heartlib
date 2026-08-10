@@ -6,8 +6,55 @@ import torch
 import torch.nn as nn
 import torchtune
 from torchtune.models import llama3_2
+from torchtune.modules import KVCache
 from torchtune.modules.common_utils import delete_kv_caches
-from typing import Optional
+from typing import Optional, Tuple
+
+
+class _PrefixKVCache(KVCache):
+    """A KVCache that hands attention only the positions actually written.
+
+    torchtune's ``KVCache.update`` returns the whole cache tensor, so a decode
+    step attends over every *allocated* position and leans on the causal mask
+    to throw the unwritten tail away. Cost is therefore pinned at the worst
+    case from the very first frame. Returning a view of the filled prefix makes
+    it grow with how far into the song we actually are.
+
+    The fill level is tracked as a Python int rather than read back from
+    ``cache_pos``, which lives on the GPU: reading that would force a device
+    sync in each of the backbone's 28 layers, on every frame.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.filled = 0
+
+    def reset(self) -> None:
+        super().reset()
+        self.filled = 0
+
+    def update(
+        self, k_val: torch.Tensor, v_val: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        k_out, v_out = super().update(k_val, v_val)
+        self.filled += k_val.shape[2]
+        return k_out[:, :, : self.filled], v_out[:, :, : self.filled]
+
+
+def _install_prefix_caches(model) -> None:
+    """Swap the caches torchtune just built for prefix-slicing ones."""
+    for layer in model.layers:
+        old = layer.attn.kv_cache
+        if old is None or isinstance(old, _PrefixKVCache):
+            continue
+        batch_size, num_heads, max_seq_len, head_dim = old.k_cache.shape
+        layer.attn.kv_cache = _PrefixKVCache(
+            batch_size=batch_size,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            dtype=old.k_cache.dtype,
+        ).to(old.k_cache.device)
 
 
 def llama3_2_3B() -> torchtune.modules.transformer.TransformerDecoder:
@@ -198,6 +245,9 @@ class HeartMuLa(PreTrainedModel):
             self.backbone.setup_caches(
                 max_batch_size, dtype, decoder_max_seq_len=backbone_max_seq_len
             )
+            # Backbone only: the decoder's cache is 8 positions deep, so there
+            # is nothing to save there.
+            _install_prefix_caches(self.backbone)
             self.decoder.setup_caches(
                 max_batch_size,
                 dtype,
@@ -227,7 +277,11 @@ class HeartMuLa(PreTrainedModel):
         b, s, _ = tokens.size()
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
-        curr_backbone_mask = _index_causal_mask(self.backbone_causal_mask, input_pos)
+        # The prefix cache will hand attention only the first `attended`
+        # positions, so the mask has to be narrowed to match.
+        curr_backbone_mask = self.backbone_causal_mask[
+            input_pos, : self._backbone_attended(s)
+        ]
 
         uncond_mask = None
         if cfg_scale > 1.0 and b > 1:
@@ -303,6 +357,14 @@ class HeartMuLa(PreTrainedModel):
             curr_pos = curr_pos[:, -1:] + 1
 
         return curr_sample
+
+    def _backbone_attended(self, seq_len: int) -> int:
+        """Number of cache positions this forward will actually attend over."""
+        cache = self.backbone.layers[0].attn.kv_cache
+        if isinstance(cache, _PrefixKVCache):
+            return cache.filled + seq_len
+        # Stock KVCache returns the whole tensor; the mask must span it.
+        return self.backbone_causal_mask.shape[0]
 
     def reset_caches(self):
         self.backbone.reset_caches()
