@@ -6,6 +6,8 @@ import torch
 import torch.nn as nn
 import torchtune
 from torchtune.models import llama3_2
+from torchtune.modules.common_utils import delete_kv_caches
+from typing import Optional
 
 
 def llama3_2_3B() -> torchtune.modules.transformer.TransformerDecoder:
@@ -87,6 +89,10 @@ def _prepare_transformer(model):
     return model, embed_dim
 
 
+def _round_up(value: int, multiple: int) -> int:
+    return -(-value // multiple) * multiple
+
+
 def _create_causal_mask(seq_len: int, device: torch.device):
     return torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=device))
 
@@ -152,17 +158,46 @@ class HeartMuLa(PreTrainedModel):
         self.muq_linear = nn.Linear(config.muq_dim, backbone_dim)
         self.post_init()
 
-    def setup_caches(self, max_batch_size: int):
+    def setup_caches(self, max_batch_size: int, max_seq_len: Optional[int] = None):
+        """Allocate the KV caches.
+
+        Args:
+            max_batch_size: Batch size the caches must hold.
+            max_seq_len: Longest position the backbone will be asked to attend
+                to, i.e. prompt length plus the number of frames to generate.
+                Defaults to the model's full context.
+
+        Sizing this to the actual request matters a lot. torchtune's KVCache
+        hands the *whole* cache tensor to attention rather than a view of the
+        filled prefix, so every decode step reads all `max_seq_len` positions
+        and softmaxes over them, only to have the causal mask discard the
+        unwritten tail. On a 2.8B backbone that is 1.75 GB of KV traffic per
+        frame at the full 8192 context. Measured on gfx1151, one backbone
+        forward: 248 ms at 8192, 150 ms at 4096, 75 ms at 1024. The output is
+        unchanged -- the positions dropped were already masked out.
+        """
         dtype = next(self.parameters()).dtype
         device = next(self.parameters()).device
 
-        try:
-            self.reset_caches()
-        except RuntimeError:
-            pass
+        backbone_max_seq_len = self.backbone.max_seq_len
+        if max_seq_len is not None:
+            # Round up: a ragged cache length buys nothing and complicates
+            # nothing, but a tidy one keeps kernel shapes predictable.
+            requested = min(_round_up(max_seq_len, 128), self.backbone.max_seq_len)
+            backbone_max_seq_len = max(requested, 128)
+
+        # reset_caches() only zeroes existing caches; it cannot resize them, and
+        # torchtune refuses (with a warning, not an error) to set up caches that
+        # already exist. Delete them so a new length actually takes effect.
+        if self.backbone.caches_are_enabled():
+            delete_kv_caches(self.backbone)
+        if self.decoder.caches_are_enabled():
+            delete_kv_caches(self.decoder)
 
         with device:
-            self.backbone.setup_caches(max_batch_size, dtype)
+            self.backbone.setup_caches(
+                max_batch_size, dtype, decoder_max_seq_len=backbone_max_seq_len
+            )
             self.decoder.setup_caches(
                 max_batch_size,
                 dtype,
@@ -171,7 +206,7 @@ class HeartMuLa(PreTrainedModel):
 
         self.register_buffer(
             "backbone_causal_mask",
-            _create_causal_mask(self.backbone.max_seq_len, device),
+            _create_causal_mask(backbone_max_seq_len, device),
         )
         self.register_buffer(
             "decoder_causal_mask",

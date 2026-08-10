@@ -196,6 +196,48 @@ Measured on the HeartMuLa decode loop: 3.42 it/s baseline, 2.97 it/s during the
 tuning run, **4.08 it/s** once tuned. It is opt-in rather than a default
 because it writes a machine-specific file into your working directory.
 
+### KV cache sizing (not AMD-specific, but it dominated everything else)
+
+Profiling one decode frame put **84.7% of the time in the backbone** (247 ms of
+292 ms) against 41 ms for the seven decoder passes — even though both use the
+same layer shape and the backbone is only 9x bigger by parameter count.
+
+The cause is in torchtune's `KVCache.update`, which returns the *entire* cache
+tensor rather than a view of the filled prefix:
+
+```python
+k_out = self.k_cache        # (batch, heads, max_seq_len, head_dim)
+```
+
+`HeartMuLa.setup_caches` used to allocate that at the model's full 8192-token
+context regardless of how much audio was requested, so every frame read 1.75 GB
+of mostly-empty KV and softmaxed over 8192 positions that the causal mask then
+threw away. Effective bandwidth was 28 GB/s against a ~256 GB/s part.
+
+`setup_caches` now takes `max_seq_len`, and the pipeline passes
+`prompt_len + max_audio_frames + 1`. Measured on gfx1151, one backbone forward:
+
+| cache length | backbone fwd | effective bandwidth |
+|---|---|---|
+| 8192 (old, always) | 248 ms | 28 GB/s |
+| 4096 (≈ 4 min of audio) | 150 ms | 41 GB/s |
+| 1024 | 75 ms | 73 GB/s |
+| 512 | 63 ms | 86 GB/s |
+
+End-to-end for 30 s of audio: **3.42 it/s → 9.07 it/s, RTF 3.65 → 1.10**, and
+wall clock 2 m 40 s → 1 m 31 s.
+
+The positions removed were already masked out, so this is mathematically a
+no-op. Verified in fp32, comparing full-context against sized-cache logits over
+a prefill plus eight decode steps: max absolute difference 6.3e-5 on a logit
+scale of 5.6 (relative 1.1e-5), with argmax and the full top-50 set identical.
+In bf16 the same comparison drifts by ~0.2 — accumulation-order noise from
+summing 8192 versus 768 terms — which top-k sampling then amplifies into a
+different (equally valid) sample. Audio statistics are unchanged: RMS 0.1418
+before, 0.1414 after.
+
+Nothing about this is ROCm-specific; a CUDA run reads the same dead KV.
+
 ### Performance summary
 
 On gfx1151, HeartMuLa's decode loop runs at ~3.4 frames/s (~4.1 tuned) against
