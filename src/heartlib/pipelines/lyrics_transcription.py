@@ -3,8 +3,10 @@ from transformers.pipelines.automatic_speech_recognition import (
 )
 from transformers.models.whisper.modeling_whisper import WhisperForConditionalGeneration
 from transformers.models.whisper.processing_whisper import WhisperProcessor
+from .._device import describe_device, resolve_device
 import torch
 import os
+from typing import Union
 
 
 class HeartTranscriptorPipeline(AutomaticSpeechRecognitionPipeline):
@@ -13,8 +15,13 @@ class HeartTranscriptorPipeline(AutomaticSpeechRecognitionPipeline):
 
     @classmethod
     def from_pretrained(
-        cls, pretrained_path: str, device: torch.device, dtype: torch.dtype
+        cls,
+        pretrained_path: str,
+        device: Union[str, torch.device],
+        dtype: torch.dtype,
     ):
+        device = resolve_device(device)
+        print(f"HeartTranscriptor will be loaded to device: {describe_device(device)}.")
         if os.path.exists(
             hearttranscriptor_path := os.path.join(
                 pretrained_path, "HeartTranscriptor-oss"

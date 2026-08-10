@@ -99,6 +99,11 @@ cd heartlib
 pip install -e .
 ```
 
+> **AMD GPU / ROCm users:** install a ROCm build of `torch` *before* running
+> `pip install -e .`, otherwise pip pulls the CUDA build from PyPI. See
+> [docs/ROCM.md](./docs/ROCM.md) for the full setup, verified on gfx1151
+> (Radeon 8060S / Ryzen AI MAX+ 395).
+
 Download our pretrained checkpoints from huggingface or modelscope using the following command:
 
 ```
@@ -143,7 +148,7 @@ By default this command will generate a piece of music conditioned on lyrics and
 
     For tags it's basically the same.
 
-2. CUDA out of memory?
+2. Out of GPU memory? (`torch.OutOfMemoryError`)
 
     If you have multi-GPUs (e.g. 2 4090s), we recommend placing the params of HeartMuLa and HeartCodec separately on different devices. You can do it by typing `--mula_device cuda:0 --codec_device cuda:1`
 
@@ -160,7 +165,7 @@ All parameters:
 - `--temperature`: Sampling temperature for generation (default: 1.0)
 - `--cfg_scale`: Classifier-free guidance scale (default: 1.5)
 - `--version`: The version of HeartMuLa, choose between [`3B`, `7B`]. (default: `3B`) # `7B` version not released yet.
-- `--mula_device/--codec_device`: The device where params will be placed. Both are set to `cuda` by default. You can use `--mula_device cuda:0 --codec_device cuda:1` to explicitly place different modules to different devices.
+- `--mula_device/--codec_device`: The device where params will be placed. Both default to `auto`, which picks the GPU when one is visible (CUDA or ROCm) and falls back to MPS, then CPU. You can use `--mula_device cuda:0 --codec_device cuda:1` to explicitly place different modules to different devices. `rocm`/`gpu` are accepted as aliases for `cuda`.
 - `--mula_dtype/--codec_dtype`: Inference dtype. By default is `bf16` for HeartMuLa and `fp32` for HeartCodec. Setting `bf16` for HeartCodec may result in the degradation of audio quality.
 - `--lazy_load`: Whether or not to use lazy loading (default: false). If turned on, modules will be loaded on demand to save GPU usage. 
 Recommended format of lyrics and tags:

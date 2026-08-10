@@ -13,29 +13,44 @@ authors = [
     {name = "HeartMuLa Team", email = "heartmula.ai@gmail.com"}
 ]
 dependencies = [
-    "numpy==2.0.2",
+    "numpy>=2.0,<3",
     "torch>=2.4,<2.11",
     "torchaudio>=2.4,<2.11",
     "torchtune==0.4.0",
+    # Required: `import torchtune` hard-imports torchao. The generic PyPI wheel
+    # imports fine against a ROCm torch (its CUDA extension is optional).
     "torchao==0.9.0",
-    "torchvision>=0.19,<0.26",
-    "tqdm==4.67.1",
-    "traitlets==5.7.1",
-    "traittypes==0.2.3",
+    "tqdm>=4.67",
     "transformers==4.57.0",
     "tokenizers==0.22.1",
-    "ipykernel==6.17.1",
-    "einops==0.8.1",
-    "accelerate==1.12.0",
-    "bitsandbytes==0.49.0",
+    "accelerate>=1.0",
     "vector-quantize-pytorch==1.27.15",
-    "modelscope==1.33.0",
     "soundfile"
 ]
+
 urls = { "homepage" = "https://heartmula.github.io/" }
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent"
+]
+
+# Nothing under `src/heartlib` imports the packages below, so they are extras
+# rather than hard requirements. That matters on ROCm: bitsandbytes has no
+# gfx1151 wheel, and requiring it would break `pip install -e .` for an
+# otherwise perfectly working ROCm environment.
+[project.optional-dependencies]
+# CUDA-only quantization stack. bitsandbytes has no gfx1151 build.
+quant = [
+    "bitsandbytes==0.49.0",
+]
+# `modelscope download` for fetching checkpoints from ModelScope.
+download = [
+    "modelscope==1.33.0",
+]
+notebook = [
+    "ipykernel>=6.17",
+    "traitlets>=5.7",
+    "traittypes>=0.2.3",
 ]
 
 [tool.setuptools]

@@ -1,12 +1,13 @@
 from tokenizers import Tokenizer
 from ..heartmula.modeling_heartmula import HeartMuLa
 from ..heartcodec.modeling_heartcodec import HeartCodec
+from .._audio import save_audio
+from .._device import describe_device, empty_cache, memory_allocated, resolve_device
 import torch
 from typing import Dict, Any, Optional, Union
 import os
 from dataclasses import dataclass
 from tqdm import tqdm
-import torchaudio
 import json
 from contextlib import contextmanager
 import gc
@@ -40,21 +41,27 @@ def _resolve_paths(pretrained_path: str, version: str):
 
 
 def _resolve_devices(
-    device: Union[torch.device, Dict[str, torch.device]], lazy_load: bool
+    device: Union[str, torch.device, Dict[str, Union[str, torch.device]]],
+    lazy_load: bool,
 ):
-    if isinstance(device, torch.device):
-        print(f"All model components will be loaded to device: {device}.")
-        mula_device = device
-        codec_device = device
+    if isinstance(device, (str, torch.device)):
+        resolved = resolve_device(device)
+        print(
+            f"All model components will be loaded to device: "
+            f"{describe_device(resolved)}."
+        )
+        mula_device = resolved
+        codec_device = resolved
     elif isinstance(device, dict):
         print("Model components will be loaded to devices as specified:")
-        for k, v in device.items():
-            print(f"  {k}: {v}")
-        mula_device = device["mula"]
-        codec_device = device["codec"]
+        resolved = {k: resolve_device(v) for k, v in device.items()}
+        for k, v in resolved.items():
+            print(f"  {k}: {describe_device(v)}")
+        mula_device = resolved["mula"]
+        codec_device = resolved["codec"]
     else:
         raise ValueError(
-            "device must be either torch.device or Dict[str, torch.device]"
+            "device must be a str, torch.device or Dict[str, Union[str, torch.device]]"
         )
 
     single_device = mula_device == codec_device
@@ -156,26 +163,26 @@ class HeartMuLaGenPipeline:
             return
         if isinstance(self._mula, HeartMuLa):
             print(f"You have set lazy_load=True. Unloading HeartMuLa from device.")
-            print(
-                f"CUDA memory before unloading: {torch.cuda.memory_allocated(self.mula_device) / 1024**3:.2f} GB"
-            )
+            before = memory_allocated(self.mula_device)
             del self._mula
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache(self.mula_device)
             print(
-                f"CUDA memory after unloading: {torch.cuda.memory_allocated(self.mula_device) / 1024**3:.2f} GB"
+                f"Device memory ({self.mula_device}) before/after unloading: "
+                f"{before / 1024**3:.2f} GB -> "
+                f"{memory_allocated(self.mula_device) / 1024**3:.2f} GB"
             )
             self._mula = None
         if isinstance(self._codec, HeartCodec):
             print(f"You have set lazy_load=True. Unloading HeartCodec from device.")
-            print(
-                f"CUDA memory before unloading: {torch.cuda.memory_allocated(self.codec_device) / 1024**3:.2f} GB"
-            )
+            before = memory_allocated(self.codec_device)
             del self._codec
             gc.collect()
-            torch.cuda.empty_cache()
+            empty_cache(self.codec_device)
             print(
-                f"CUDA memory after unloading: {torch.cuda.memory_allocated(self.codec_device) / 1024**3:.2f} GB"
+                f"Device memory ({self.codec_device}) before/after unloading: "
+                f"{before / 1024**3:.2f} GB -> "
+                f"{memory_allocated(self.codec_device) / 1024**3:.2f} GB"
             )
             self._codec = None
         return
@@ -339,7 +346,7 @@ class HeartMuLaGenPipeline:
         frames = model_outputs["frames"].to(self.codec_device)
         wav = self.codec.detokenize(frames)
         self._unload()
-        torchaudio.save(save_path, wav.to(torch.float32).cpu(), 48000)
+        save_audio(save_path, wav, 48000)
 
     def __call__(self, inputs: Dict[str, Any], **kwargs):
         preprocess_kwargs, forward_kwargs, postprocess_kwargs = (
@@ -353,7 +360,7 @@ class HeartMuLaGenPipeline:
     def from_pretrained(
         cls,
         pretrained_path: str,
-        device: Union[torch.device, Dict[str, torch.device]],
+        device: Union[str, torch.device, Dict[str, Union[str, torch.device]]],
         dtype: Union[torch.dtype, Dict[str, torch.dtype]],
         version: str,
         lazy_load: bool = False,

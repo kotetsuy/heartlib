@@ -27,8 +27,9 @@ def str2dtype(value):
 
 
 def str2device(value):
-    value = value.lower()
-    return torch.device(value)
+    # Kept as a plain string: the pipeline resolves it (including "auto",
+    # "rocm" and "gpu") so that resolution happens in one place.
+    return value.lower()
 
 
 def parse_args():
@@ -43,8 +44,8 @@ def parse_args():
     parser.add_argument("--topk", type=int, default=50)
     parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--cfg_scale", type=float, default=1.5)
-    parser.add_argument("--mula_device", type=str2device, default="cuda")
-    parser.add_argument("--codec_device", type=str2device, default="cuda")
+    parser.add_argument("--mula_device", type=str2device, default="auto")
+    parser.add_argument("--codec_device", type=str2device, default="auto")
     parser.add_argument("--mula_dtype", type=str2dtype, default="bfloat16")
     parser.add_argument("--codec_dtype", type=str2dtype, default="float32")
     parser.add_argument("--lazy_load", type=str2bool, default=False)
@@ -56,8 +57,8 @@ if __name__ == "__main__":
     pipe = HeartMuLaGenPipeline.from_pretrained(
         args.model_path,
         device={
-            "mula": torch.device(args.mula_device),
-            "codec": torch.device(args.codec_device),
+            "mula": args.mula_device,
+            "codec": args.codec_device,
         },
         dtype={
             "mula": args.mula_dtype,

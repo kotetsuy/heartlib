@@ -7,6 +7,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--music_path", type=str, default="./assets/output.mp3")
+    parser.add_argument("--device", type=str, default="auto")
 
     return parser.parse_args()
 
@@ -15,7 +16,7 @@ if __name__ == "__main__":
     args = parse_args()
     pipe = HeartTranscriptorPipeline.from_pretrained(
         args.model_path,
-        device=torch.device("cuda"),
+        device=args.device,
         dtype=torch.float16,
     )
     with torch.no_grad():
