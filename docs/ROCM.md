@@ -26,6 +26,19 @@ that hard-code `cuda`.
 
 ## Install
 
+On a fresh clone, one command does everything — detect the GPU architecture,
+build the virtualenv, install a ROCm torch and heartlib, and fetch the
+checkpoints:
+
+```bash
+./scripts/setup_rocm.sh                     # ~21 GB of checkpoints included
+./scripts/setup_rocm.sh --skip-checkpoints  # code and environment only
+```
+
+It is safe to re-run: an existing `.venv` is reused rather than rebuilt.
+`GFX_ARCH`, `TORCH_VERSION`, `PYTHON_VERSION` and `VENV_DIR` override the
+defaults. The rest of this section is what the script does, by hand.
+
 **Do not `pip install -e .` first** — that would pull the CUDA build of torch
 from PyPI. Install a ROCm torch matching your GPU architecture, then heartlib.
 
@@ -195,6 +208,26 @@ LPDDR5X. Nothing about it is broken; it is bandwidth.
 
 Cosmetic. gfx1151 does not implement XNACK; the code object requests it off
 anyway. Nothing to do.
+
+## Setting this up on another machine
+
+Only source is in git — the virtualenv and the ~21 GB of checkpoints are not,
+and are both re-created by the setup script.
+
+```bash
+git clone -b rocm-support git@github.com:kotetsuy/heartlib.git
+cd heartlib
+./scripts/setup_rocm.sh
+```
+
+If the other machine has a different AMD GPU, the script picks the matching
+wheel index from `rocminfo` on its own; only the gfx1151-specific performance
+notes below are architecture-bound. To pull in later upstream work:
+
+```bash
+git remote add upstream git@github.com:HeartMuLa/heartlib.git   # once
+git fetch upstream && git rebase upstream/main
+```
 
 ## Troubleshooting
 
