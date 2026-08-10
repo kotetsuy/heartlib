@@ -39,6 +39,13 @@ It is safe to re-run: an existing `.venv` is reused rather than rebuilt.
 `GFX_ARCH`, `TORCH_VERSION`, `PYTHON_VERSION` and `VENV_DIR` override the
 defaults. The rest of this section is what the script does, by hand.
 
+Then, once per machine, tune the GEMM kernels — worth ~35% on the generation
+loop and picked up automatically afterwards:
+
+```bash
+./scripts/tune_rocm.sh
+```
+
 **Do not `pip install -e .` first** — that would pull the CUDA build of torch
 from PyPI. Install a ROCm torch matching your GPU architecture, then heartlib.
 
@@ -173,28 +180,36 @@ so `MIOPEN_FIND_MODE=NORMAL` opts back out. End-to-end, on 20 s of audio:
 | warm run, MIOpen default | 4 m 18 s |
 | warm run, `MIOPEN_FIND_MODE=FAST` | **1 m 44 s** |
 
-### Optional: hipBLASLt TunableOp, ~19% on the generation loop
+### hipBLASLt TunableOp — run `scripts/tune_rocm.sh` once, get ~35%
 
-PyTorch's TunableOp benchmarks the available hipBLASLt/rocBLAS GEMM kernels for
-your exact shapes and pins the winners. Tune once:
-
-```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_FILENAME=$PWD/tunable.csv \
-  python ./examples/run_music_generation.py --model_path=./ckpt --max_audio_length_ms=10000
-```
-
-That writes `tunable0.csv` (the device ordinal is appended). Re-use it, with
-tuning off, on every later run:
+PyTorch's TunableOp benchmarks the available hipBLASLt/rocBLAS kernels for each
+GEMM shape and pins the winners. Tune once per machine:
 
 ```bash
-PYTORCH_TUNABLEOP_ENABLED=1 PYTORCH_TUNABLEOP_TUNING=0 \
-PYTORCH_TUNABLEOP_FILENAME=$PWD/tunable.csv \
-  python ./examples/run_music_generation.py --model_path=./ckpt
+./scripts/tune_rocm.sh
 ```
 
-Measured on the HeartMuLa decode loop: 3.42 it/s baseline, 2.97 it/s during the
-tuning run, **4.08 it/s** once tuned. It is opt-in rather than a default
-because it writes a machine-specific file into your working directory.
+It writes `~/.cache/heartlib/tunableop_<arch>_0.csv`, which `_rocm.py` then
+finds and replays automatically — no environment variables to set, and no
+tuning ever happens implicitly.
+
+| 30 s of audio | generation loop | RTF | wall clock |
+|---|---|---|---|
+| untuned | 9.53 it/s | 1.05 | 1 m 29 s |
+| tuned | **12.96 it/s** | **0.96** | **57 s** |
+
+Tuning must stay a deliberate, separate step. With the prefix KV cache the
+attention GEMMs change shape on every frame, so a tuning run explores a far
+larger space than it used to (546 entries against 4 before) and is itself
+~3x slower than a normal run. The results still transfer to lengths that were
+never tuned — most of the win is in the fixed-shape projections — so the
+4-minute default gets 7.78 → 9.47 it/s (RTF 1.61 → 1.32) from a 20-second
+tuning run.
+
+Replay never re-tunes: shapes absent from the file fall back to the default
+kernel, and a file that no longer matches the machine (PyTorch version, ROCm
+version, `GCN_ARCH_NAME` are all recorded as validators) produces a
+`Failed validator` warning and is ignored. Delete the cache file to re-tune.
 
 ### KV cache sizing (not AMD-specific, but it dominated everything else)
 
@@ -238,13 +253,64 @@ before, 0.1414 after.
 
 Nothing about this is ROCm-specific; a CUDA run reads the same dead KV.
 
+#### Attending only over the filled prefix
+
+Sizing the cache to the request still pays the worst case from frame one: a
+4-minute generation allocates ~3456 positions and reads all of them while
+producing frame 1, when only ~400 are written.
+
+`_PrefixKVCache` (in `modeling_heartmula.py`) subclasses torchtune's `KVCache`
+and returns a view of the positions actually written; `generate_frame` narrows
+the causal mask to match. Cost now tracks how far into the song we are rather
+than how long the song was allowed to be.
+
+The fill level is a Python `int` rather than `KVCache.size`, which reads
+`cache_pos` off the GPU — that would be a device sync in each of the 28
+backbone layers, every frame.
+
+| | backbone fwd at position ~400 |
+|---|---|
+| cache allocated 768 | 68 ms → **60 ms** |
+| cache allocated 3456 | 134 ms → **60 ms** |
+
+Also equivalent rather than approximate, and checked the same way: fp32 max
+absolute logit difference 8.9e-5 on a scale of 5.6, argmax and top-50 set
+identical to the stock full-cache path.
+
+#### Where the time goes now
+
+Per frame, 30 s generation, after both fixes:
+
+| stage | time | share |
+|---|---|---|
+| backbone forward | 59.8 ms | 57% |
+| decoder forwards (7x) | 40.7 ms | 39% |
+| sampling + embed + EOS check | 3.5 ms | 3% |
+
+The seven decoder passes read 4.36 GB of weights per frame at ~107 GB/s, which
+is at the practical ceiling for this part — they are sequential by
+construction, since each codebook conditions on the previous one. Going
+further would mean quantization, not scheduling.
+
 ### Performance summary
 
-On gfx1151, HeartMuLa's decode loop runs at ~3.4 frames/s (~4.1 tuned) against
-the 12.5 Hz frame rate, i.e. RTF ≈ 3.7 (≈ 3.1 tuned) — slower than the RTF ≈ 1.0
-the README quotes for datacenter NVIDIA parts. The loop is dominated by the 3B
-backbone, one forward per 80 ms frame, on an APU whose weights live in
-LPDDR5X. Nothing about it is broken; it is bandwidth.
+The frame rate is 12.5 Hz, so RTF 1.0 means 12.5 it/s on the generation loop.
+
+| | 30 s of audio | 4-minute default |
+|---|---|---|
+| as cloned | 3.42 it/s — RTF 3.65 | 3.42 it/s — RTF 3.65 |
+| KV cache sized to the request | 9.07 — RTF 1.10 | 5.69 — RTF 1.76 |
+| + attend only the filled prefix | 9.53 — RTF 1.05 | 7.78 — RTF 1.61 |
+| + `scripts/tune_rocm.sh` | **12.96 — RTF 0.96** | **9.47 — RTF 1.32** |
+
+3.8x on 30-second generations and faster than real time, on an APU, from a
+starting point of RTF 3.65. Two of the three steps are backend-independent
+wins that a CUDA run would also see.
+
+What is left is bandwidth. Per frame the model reads ~5.25 GB of backbone
+weights plus 4.36 GB across the seven decoder passes, and those passes are
+sequential by construction — each codebook conditions on the previous. The
+next real step would be quantization, not scheduling.
 
 ### `xnack 'Off' was requested for a processor that does not support it`
 
